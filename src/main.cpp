@@ -1,40 +1,82 @@
+/*
+  PS5 Controlled Smart Car
+
+  Features:
+  - Differential drive motor control (throttle + steering mixing)
+  - Deadzone filtering for triggers and joystick
+  - Non-blocking RGB + buzzer feedback system
+  - Honk feature
+  - Connection state detection
+
+  Architecture:
+  loop():
+    1. Read controller input
+    2. Update feedback system (non-blocking)
+    3. Compute drive command
+    4. Map motor outputs
+    5. Write PWM to motors
+    6. Handle honk override
+
+  Design Philosophy:
+  - No delay() anywhere
+  - All time-based behavior uses millis()
+  - Motors, Bluetooth, and feedback run concurrently
+*/
+
 #include <Arduino.h>
 #include <ps5Controller.h>
 
+// ======================== PIN DEFINITIONS ========================
+// Motor driver pins (H-Bridge inputs)
 #define M1A 5
 #define M1B 18
 #define M2A 19
 #define M2B 21
 
+// Feedback pins
 #define BUZ 33
 #define RED 25
 #define GREEN 26
 #define BLUE 27
 
-int PWM_FREQ = 10000;
-int PWM_RESOLUTION = 8;
+// ======================== PWM CONFIGURATION ========================
+// Using ESP32 LEDC hardware PWM for motor speed control
+int PWM_FREQ = 10000;       // 10kHz PWM
+int PWM_RESOLUTION = 8;     // 8-bit resolution (0–255)
+
 int CH_M1A = 0;
 int CH_M1B = 1;
 int CH_M2A = 2;
 int CH_M2B = 3;
 
+// Used for throttled serial printing
 unsigned long lastPrintedMs = 0;
 bool lastConnectedState = false;
 
+// Deadzone thresholds to ignore small joystick noise
 int leftStickDeadzone = 10;
 int triggerDeadzone = 6;
 
+// ======================== FEEDBACK STATE MACHINE ========================
+/*
+  Stores all timing and state variables for:
+  - Non-blocking buzzer pattern playback
+  - Non-blocking RGB blink playback
 
+  This struct acts as a small state machine.
+*/
 struct feedbackState { 
   bool lastConnected = false;
 
+  // ---- Buzzer state ----
   bool buzzerActive = false;
   bool buzzerOn = false;
   unsigned long buzzerLastMs = 0;
   int buzzerStep = 0;
   int buzzerLen = 0;
-  int buzzerPattern[4];
+  int buzzerPattern[4];   // Alternating ON/OFF durations (max 2 beeps)
 
+  // ---- RGB state ----
   bool rgbActive = false;
   bool rgbOn = false;
   unsigned long rgbLastMs = 0;
@@ -47,21 +89,29 @@ struct feedbackState {
 
 feedbackState feedback;
 
+// ======================== CONTROLLER & DRIVE STRUCTURES ========================
+
 enum StopMode {
-  COAST,
-  BRAKE
+  COAST,   // Motor free-spins when stopped
+  BRAKE    // Motor actively brakes when stopped
 };
 
+/*
+  Raw input from controller.
+*/
 struct ControllerInput {
   bool connected;
-  int lx;
+  int lx;              // Left stick X (steering)
   int ly;
-  unsigned int r2;
-  unsigned int l2;
+  unsigned int r2;     // Right trigger (forward throttle)
+  unsigned int l2;     // Left trigger (reverse throttle)
 };
 
 ControllerInput controller;
 
+/*
+  Processed drive intent.
+*/
 struct DriveCommand {
   int throttle;
   int steering;
@@ -71,6 +121,9 @@ struct DriveCommand {
 
 DriveCommand driveCommand;
 
+/*
+  Final PWM output for one motor.
+*/
 struct MotorOut {
   int pwmA;
   int pwmB;
@@ -79,16 +132,18 @@ struct MotorOut {
 MotorOut leftMotor;
 MotorOut rightMotor;
 
-void startBeepPattern(int beepCount);
-void updateBuzzer(unsigned long nowMs);
-
+// ======================== RGB CONTROL ========================
+// Sets RGB LED pins HIGH or LOW
 void setRGB(int r, int g, int b) {
   digitalWrite(RED, r ? HIGH : LOW);
   digitalWrite(GREEN, g ? HIGH : LOW);
   digitalWrite(BLUE, b ? HIGH : LOW);
 }
 
-
+/*
+  Prepares an RGB blink pattern (non-blocking).
+  Does NOT block — only sets initial state.
+*/
 void startRGBBlink (int r, int g, int b, int intervalMs, int blinkCount) { 
   feedback.r = r; feedback.g = g; feedback.b = b;
   feedback.rgbIntervalMs = intervalMs;
@@ -102,6 +157,9 @@ void startRGBBlink (int r, int g, int b, int intervalMs, int blinkCount) {
   setRGB(0, 0, 0);
 }
 
+/*
+  Advances RGB blink pattern using millis().
+*/
 void updateRGB(unsigned long nowMs) {
   if (!feedback.rgbActive) return;
 
@@ -123,6 +181,61 @@ void updateRGB(unsigned long nowMs) {
   }
 }
 
+// ======================== BUZZER STATE MACHINE ========================
+/*
+  buzzerPattern[] stores alternating ON and OFF durations in ms.
+  buzzerStep tracks which duration is currently active.
+  This forms a simple state machine driven by millis().
+*/
+
+void startBeepPattern(int beepCount) {
+  if (beepCount < 1) return;
+  if (beepCount > 2) beepCount = 2;
+
+  feedback.buzzerStep = 0;
+  feedback.buzzerLen = beepCount * 2;
+
+  // Build timing pattern: ON, OFF, ON, OFF...
+  for (int i = 0; i < beepCount; i++) {
+    feedback.buzzerPattern[i * 2] = 120;
+    feedback.buzzerPattern[i * 2 + 1] = 120;
+  }
+
+  feedback.buzzerActive = true;
+  feedback.buzzerOn = true;
+  feedback.buzzerLastMs = millis();
+  digitalWrite(BUZ, HIGH);
+}
+
+/*
+  Advances buzzer pattern using millis().
+  No blocking delays.
+*/
+void updateBuzzer(unsigned long nowMs) {
+  if (!feedback.buzzerActive) return;
+
+  int dur = feedback.buzzerPattern[feedback.buzzerStep];
+
+  if (nowMs - feedback.buzzerLastMs >= (unsigned long) dur) {
+    feedback.buzzerStep++;
+    feedback.buzzerLastMs = nowMs;
+  }
+
+  if (feedback.buzzerStep >= feedback.buzzerLen) {
+    feedback.buzzerActive = false;
+    digitalWrite(BUZ, LOW);
+    return;
+  }
+
+  feedback.buzzerOn = !feedback.buzzerOn;
+  digitalWrite(BUZ, feedback.buzzerOn ? HIGH : LOW);
+}
+
+/*
+  Handles connection state changes and triggers:
+  - 1 beep + green blink on connect
+  - 2 beeps + red blink on disconnect
+*/
 void handleFeedback(bool connected) {
   unsigned long now = millis();
 
@@ -141,55 +254,12 @@ void handleFeedback(bool connected) {
   updateRGB(now);
 }
 
-void startBeepPattern(int beepCount) {
-  if (beepCount < 1) return;
-  if (beepCount > 2) beepCount = 2;
-
-  feedback.buzzerStep = 0;
-  feedback.buzzerLen = beepCount * 2;
-
-  for (int i = 0; i < beepCount; i++) {
-    feedback.buzzerPattern[i * 2] = 120;
-    feedback.buzzerPattern[i * 2 + 1] = 120;
-  }
-
-  feedback.buzzerActive = true;
-  feedback.buzzerOn = true;
-  feedback.buzzerLastMs = millis();
-  digitalWrite(BUZ, HIGH);
-}
-
-void updateBuzzer(unsigned long nowMs) {
-  if (!feedback.buzzerActive) return;
-
-  // duration for the current step
-  int dur = feedback.buzzerPattern[feedback.buzzerStep];
-
-  // check if the current step is done
-
-  if (nowMs - feedback.buzzerLastMs >= (unsigned long) dur) {
-    feedback.buzzerStep++;
-    feedback.buzzerLastMs = nowMs;
-  }
-
-  // checks if the pattern is done
-  if (feedback.buzzerStep >= feedback.buzzerLen) {
-    feedback.buzzerActive = false;
-    digitalWrite(BUZ, LOW);
-    return;
-  }
-
-  // toggle the buzzer on and off
-  feedback.buzzerOn = !feedback.buzzerOn;
-  digitalWrite(BUZ, feedback.buzzerOn ? HIGH : LOW);
-
-}
+// ======================== MOTOR CONTROL ========================
 
 MotorOut mapMotor(int cmd, enum StopMode stop) {
   MotorOut m;
 
   int magnitude = abs(cmd);
-   
   if (magnitude > 255) magnitude = 255;
 
   if (cmd > 0) {
@@ -206,8 +276,9 @@ MotorOut mapMotor(int cmd, enum StopMode stop) {
     m.pwmB = 255;
   }
   return m;
-} 
+}
 
+// Eliminates small joystick noise near zero
 int applyDeadzone(int value, int deadzone) {
   if (abs(value) < deadzone) {
     return 0;
@@ -215,9 +286,12 @@ int applyDeadzone(int value, int deadzone) {
   return value;
 }
 
+/*
+  Differential drive mixing:
+    left  = throttle + steering
+    right = throttle - steering
+*/
 void computeDriveCommand(const ControllerInput c, DriveCommand &d) {
-  
-  // Applying trigger deadzone
   int r2 = (c.r2 < triggerDeadzone) ? 0 : c.r2;
   int l2 = (c.l2 < triggerDeadzone) ? 0 : c.l2;
 
@@ -227,11 +301,9 @@ void computeDriveCommand(const ControllerInput c, DriveCommand &d) {
   d.throttle = applyDeadzone(throttle, triggerDeadzone);
   d.steering = applyDeadzone(steering, leftStickDeadzone);
 
-  // Computing left and right motor commands
   d.left = d.throttle + d.steering;
   d.right = d.throttle - d.steering;
 
-  // Clamping the motor commands to the range [-255, 255]
   if (d.left > 255) d.left = 255;
   if (d.left < -255) d.left = -255;
 
@@ -239,122 +311,23 @@ void computeDriveCommand(const ControllerInput c, DriveCommand &d) {
   if (d.right < -255) d.right = -255;
 }
 
-void printDriveCommand(const DriveCommand d, const ControllerInput c) {
-
-  unsigned long now = millis();
-
-  if (c.connected != lastConnectedState) {
-    lastConnectedState = c.connected;
-
-    Serial.print("Status: ");
-    Serial.println(c.connected ? "Connected" : "Disconnected");
-
-    lastPrintedMs = now;
-    return;
-  }
-
-  if (!c.connected) return;
-
-  if (now - lastPrintedMs >= 100) {
-
-    lastPrintedMs = now;
-
-    Serial.print("Throttle: ");
-    Serial.print(d.throttle);
-    Serial.print(" Steering: ");
-    Serial.print(d.steering);
-    Serial.print(" Left Motor: ");
-    Serial.print(d.left);
-    Serial.print(" Right Motor: ");
-    Serial.println(d.right);
-    
-  }
-
-}
-
-void printMotorOut(const MotorOut &m, const char* name, const ControllerInput &c) {
-  
-  unsigned long now = millis();
-
-  if (c.connected != lastConnectedState) {
-    lastConnectedState = c.connected;
-
-    Serial.print("Status: ");
-    Serial.println(c.connected ? "Connected" : "Disconnected");
-
-    lastPrintedMs = now;
-    return;
-  }
-
-  if (!c.connected) return;
-
-  if (now - lastPrintedMs >= 100) {
-
-    lastPrintedMs = now;
-
-    Serial.print(name);
-    Serial.print(" - PWM A: ");
-    Serial.print(m.pwmA);
-    Serial.print(" PWM B: ");
-    Serial.println(m.pwmB);
-    
-  }
-
-}
-
+// Reads controller safely
 void readController(ControllerInput &c) {
   c.connected = ps5.isConnected();
   if (c.connected) {
     c.lx = ps5.LStickX();
-  
-  c.ly = ps5.LStickY();
-  
-  c.l2 = ps5.L2Value();
-  
-  c.r2 = ps5.R2Value();
+    c.ly = ps5.LStickY();
+    c.l2 = ps5.L2Value();
+    c.r2 = ps5.R2Value();
   } else {
     c.lx = 0;
     c.ly = 0;
     c.l2 = 0;
     c.r2 = 0;
   }
-  
 }
 
-void printController(const ControllerInput c) {
-  unsigned long now = millis();
-
-  if (c.connected != lastConnectedState) {
-    lastConnectedState = c.connected;
-
-    Serial.print("Status: ");
-    Serial.println(c.connected ? "Connected" : "Disconnected");
-
-    lastPrintedMs = now;
-    return;
-  }
-
-  if (!c.connected) return;
-
-  if (now - lastPrintedMs >= 100) {
-
-    lastPrintedMs = now;
-
-    Serial.print("R2: ");
-    Serial.print(c.r2);
-    Serial.print(" ");
-    Serial.print("L2: ");
-    Serial.print(c.l2);
-    Serial.print(" ");
-    Serial.print("Left Stick X: ");
-    Serial.println(c.lx);
-    
-  }
-
-}
-
-
-
+// Sends PWM values to ESP32 LEDC channels
 void writeMotorOutputs(const MotorOut left, const MotorOut right) {
   ledcWrite(CH_M1A, left.pwmA);
   ledcWrite(CH_M1B, left.pwmB);
@@ -362,9 +335,9 @@ void writeMotorOutputs(const MotorOut left, const MotorOut right) {
   ledcWrite(CH_M2B, right.pwmB);
 }
 
-void setup() {
-  // put your setup code here, to run once:
+// ======================== SETUP ========================
 
+void setup() {
 
   Serial.begin(115200);
   Serial.println(esp_reset_reason());
@@ -378,7 +351,6 @@ void setup() {
   pinMode(GREEN, OUTPUT);
   pinMode(BLUE, OUTPUT);
   setRGB(0, 0, 0);
-
 
   pinMode(M1A, OUTPUT);
   pinMode(M1B, OUTPUT);
@@ -394,30 +366,30 @@ void setup() {
   ledcAttachPin(M1B, CH_M1B);
   ledcAttachPin(M2A, CH_M2A);
   ledcAttachPin(M2B, CH_M2B);
-
 }
 
+// ======================== MAIN LOOP ========================
+// Non-blocking control loop
+
 void loop() {
+
   readController(controller);
+
   handleFeedback(controller.connected);
-  //printController(controller);
+
   computeDriveCommand(controller, driveCommand);
-  //printDriveCommand(driveCommand, controller);
 
   leftMotor = mapMotor(driveCommand.left, COAST);
   rightMotor = mapMotor(driveCommand.right, COAST);
 
-  printMotorOut(leftMotor, "Left Motor", controller);
-  printMotorOut(rightMotor, "Right Motor", controller);
-
-  // Set motor outputs
   writeMotorOutputs(leftMotor, rightMotor);
 
+  // Honk feature:
+  // While Circle button is pressed,
+  // buzzer is driven HIGH continuously.
   if (ps5.Circle()) {
     digitalWrite(BUZ, HIGH);
   } else {
     digitalWrite(BUZ, LOW);
   }
-
 }
-
