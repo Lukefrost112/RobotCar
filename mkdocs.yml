@@ -1,0 +1,8 @@
+site_name: PS5 Controlled Smart Car
+site_description: Documentation for the ESP32 + PS5 controlled smart car project
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Buzzer System: buzzer.md
