@@ -363,8 +363,8 @@ int applyDeadzone(int value, int deadzone) {
     right = throttle - steering
 */
 void computeDriveCommand(const ControllerInput c, DriveCommand &d) {
-  int r2 = (c.r2 < triggerDeadzone) ? 0 : c.r2;
-  int l2 = (c.l2 < triggerDeadzone) ? 0 : c.l2;
+  int r2 = c.r2;
+  int l2 = c.l2;
 
   int throttle = r2 - l2;
   int steering = c.lx;
