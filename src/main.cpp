@@ -57,6 +57,9 @@ bool lastConnectedState = false;
 int leftStickDeadzone = 10;
 int triggerDeadzone = 6;
 
+int boostIntervalMs = 50; // interval of boost buzzer sound
+int reverseIntervalMs = 400; // interval of reverse buzzer sound
+
 // ======================== FEEDBACK STATE MACHINE ========================
 /*
   Stores all timing and state variables for:
@@ -91,6 +94,18 @@ feedbackState feedback;
 
 // ======================== CONTROLLER & DRIVE STRUCTURES ========================
 
+enum BuzzerState {
+  PATTERN,
+  BOOST,
+  REVERSE,
+  HORN,
+  STANDBY
+};
+
+BuzzerState buzzerState;
+BuzzerState lastBuzzerState;
+unsigned long buzzerModeStartMs;
+
 enum StopMode {
   COAST,   // Motor free-spins when stopped
   BRAKE    // Motor actively brakes when stopped
@@ -105,6 +120,8 @@ struct ControllerInput {
   int ly;
   unsigned int r2;     // Right trigger (forward throttle)
   unsigned int l2;     // Left trigger (reverse throttle)
+  bool honk;
+  bool boost;
 };
 
 ControllerInput controller;
@@ -163,23 +180,26 @@ void startRGBBlink (int r, int g, int b, int intervalMs, int blinkCount) {
 void updateRGB(unsigned long nowMs) {
   if (!feedback.rgbActive) return;
 
-  if (nowMs - feedback.rgbLastMs >= (unsigned long) feedback.rgbIntervalMs) {
+  if (nowMs - feedback.rgbLastMs >= feedback.rgbIntervalMs) {
     feedback.rgbLastMs = nowMs;
 
     feedback.rgbOn = !feedback.rgbOn;
-    
-    if(feedback.rgbOn) {
+
+    if (feedback.rgbOn) {
+      // Turn ON
       setRGB(feedback.r, feedback.g, feedback.b);
     } else {
+      // Turn OFF
       setRGB(0, 0, 0);
-    }
 
-    feedback.rgbBlinksLeft--;
-    if (feedback.rgbBlinksLeft <= 0) {
-      feedback.rgbActive = false;
+      feedback.rgbBlinksLeft--;
+      if (feedback.rgbBlinksLeft <= 0) {
+        feedback.rgbActive = false;
+      }
     }
   }
 }
+
 
 // ======================== BUZZER STATE MACHINE ========================
 /*
@@ -214,21 +234,33 @@ void startBeepPattern(int beepCount) {
 void updateBuzzer(unsigned long nowMs) {
   if (!feedback.buzzerActive) return;
 
-  int dur = feedback.buzzerPattern[feedback.buzzerStep];
-
-  if (nowMs - feedback.buzzerLastMs >= (unsigned long) dur) {
-    feedback.buzzerStep++;
-    feedback.buzzerLastMs = nowMs;
-  }
-
+  // If we've reached the end of the pattern, stop and force OFF
   if (feedback.buzzerStep >= feedback.buzzerLen) {
     feedback.buzzerActive = false;
     digitalWrite(BUZ, LOW);
     return;
   }
 
-  feedback.buzzerOn = !feedback.buzzerOn;
-  digitalWrite(BUZ, feedback.buzzerOn ? HIGH : LOW);
+  int dur = feedback.buzzerPattern[feedback.buzzerStep];
+
+  // Only change state when the duration has passed
+  if (nowMs - feedback.buzzerLastMs >= (unsigned long)dur) {
+    feedback.buzzerLastMs = nowMs;
+
+    // Move to next step in the pattern
+    feedback.buzzerStep++;
+
+    // If that was the last step, stop and force OFF
+    if (feedback.buzzerStep >= feedback.buzzerLen) {
+      feedback.buzzerActive = false;
+      digitalWrite(BUZ, LOW);
+      return;
+    }
+
+    // Toggle ON/OFF for the next step
+    feedback.buzzerOn = !feedback.buzzerOn;
+    digitalWrite(BUZ, feedback.buzzerOn ? HIGH : LOW);
+  }
 }
 
 /*
@@ -243,15 +275,54 @@ void handleFeedback(bool connected) {
     feedback.lastConnected = connected;
     if (connected) {
       startBeepPattern(1);
-      startRGBBlink(0, 1, 0, 1, 120);
+      startRGBBlink(0, 1, 0, 120, 1);
     } else {
       startBeepPattern(2);
-      startRGBBlink(1, 0, 0, 2, 120);
+      startRGBBlink(1, 0, 0, 120, 2);
     }
   }
-
-  updateBuzzer(now);
   updateRGB(now);
+}
+
+void decideBuzzerState(feedbackState &fb, BuzzerState &buzstate, const ControllerInput c) {
+  if (fb.buzzerActive && fb.buzzerStep < fb.buzzerLen) {
+    buzstate = PATTERN;
+  } else if (c.honk) {
+    buzstate = HORN;
+  } else if (c.boost) {
+    buzstate = BOOST;
+  } else if ((int)c.r2 - (int)c.l2 < -20) { // Reverse threshold
+    buzstate = REVERSE;
+  } else {
+    buzstate = STANDBY;
+  }
+}
+
+void updateBuzzerSystem(BuzzerState buzstate) {
+  unsigned long now = millis();
+  switch (buzstate) {
+    case PATTERN:
+      updateBuzzer(now);
+      break;
+    case HORN:
+      digitalWrite(BUZ, HIGH);
+      break;
+    case BOOST:
+      if (now - buzzerModeStartMs >= boostIntervalMs) {
+        digitalWrite(BUZ, !digitalRead(BUZ)); // Toggle buzzer state
+        buzzerModeStartMs = now;
+      } 
+      break;
+    case REVERSE:
+      if (now - buzzerModeStartMs >= reverseIntervalMs) {
+        digitalWrite(BUZ, !digitalRead(BUZ)); // Toggle buzzer state
+        buzzerModeStartMs = now;
+      } 
+      break;
+    case STANDBY:
+      digitalWrite(BUZ, LOW);
+      break;
+  }
 }
 
 // ======================== MOTOR CONTROL ========================
@@ -319,11 +390,15 @@ void readController(ControllerInput &c) {
     c.ly = ps5.LStickY();
     c.l2 = ps5.L2Value();
     c.r2 = ps5.R2Value();
+    c.honk = ps5.R1();
+    c.boost = ps5.Circle();
   } else {
     c.lx = 0;
     c.ly = 0;
     c.l2 = 0;
     c.r2 = 0;
+    c.honk = false;
+    c.boost = false;
   }
 }
 
@@ -375,6 +450,16 @@ void loop() {
 
   readController(controller);
 
+  decideBuzzerState(feedback, buzzerState, controller);
+
+  if (buzzerState != lastBuzzerState) {
+    lastBuzzerState = buzzerState;
+    buzzerModeStartMs = millis();
+    digitalWrite(BUZ, LOW); // Ensure buzzer is off when changing state
+  }
+
+  updateBuzzerSystem(buzzerState);
+
   handleFeedback(controller.connected);
 
   computeDriveCommand(controller, driveCommand);
@@ -383,13 +468,5 @@ void loop() {
   rightMotor = mapMotor(driveCommand.right, COAST);
 
   writeMotorOutputs(leftMotor, rightMotor);
-
-  // Honk feature:
-  // While Circle button is pressed,
-  // buzzer is driven HIGH continuously.
-  if (ps5.Circle()) {
-    digitalWrite(BUZ, HIGH);
-  } else {
-    digitalWrite(BUZ, LOW);
-  }
+  
 }
