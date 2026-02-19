@@ -1,8 +1,14 @@
 site_name: PS5 Controlled Smart Car
-site_description: Documentation for the ESP32 + PS5 controlled smart car project
+site_description: ESP32 smart car controlled via PS5 DualSense (non-blocking firmware)
 theme:
   name: material
+
 nav:
   - Home: index.md
   - Architecture: architecture.md
-  - Buzzer System: buzzer.md
+  - Firmware Reference:
+      - Overview: firmware/overview.md
+      - Functions: firmware/functions.md
+      - Buzzer System: firmware/buzzer.md
+      - RGB System: firmware/rgb.md
+      - Motor Control: firmware/motor.md
