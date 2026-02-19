@@ -12,3 +12,7 @@ nav:
       - Buzzer System: firmware/buzzer.md
       - RGB System: firmware/rgb.md
       - Motor Control: firmware/motor.md
+      - Wiring: wiring.md
+  - Hardware:
+      - Overview: hardware.md
+
