@@ -62,10 +62,9 @@ int reverseIntervalMs = 400;  // interval of reverse buzzer sound
 
 unsigned long lastModeSwitchMs = 0;
 
-// (You can keep these, but steering is now controlled by base+boost below)
-float ecoTurnScale = 0.6;
-float normalTurnScale = 0.8;
-float sportTurnScale = 1.0;
+int straightThreshold = 20; // If steering is within this range, consider it straight for feedback purposes
+float leftTrim = 0.92; // Adjust this to trim left motor if car veers right when stick is centered
+float rightTrim = 1.00; // Adjust this to trim right motor if car veers left
 
 // ======================== FEEDBACK STATE MACHINE ========================
 struct feedbackState { 
@@ -391,7 +390,7 @@ MotorOut mapMotor(int cmd, enum StopMode stop) {
   return m;
 }
 
-// --------- NEW STEERING MODEL (what you asked for) ---------
+// --------- NEW STEERING MODEL ---------
 // Fixed base steering per mode, plus extra steering as speed increases.
 //
 // steeringStrength = base + boost * speedNormalized
@@ -460,6 +459,12 @@ void computeDriveCommand(const ControllerInput c, DriveCommand &d, DriveMode mod
   // Mix
   d.left  = d.throttle + d.steering;
   d.right = d.throttle - d.steering;
+
+  if (abs(d.steering) <= straightThreshold && abs(d.throttle) > 20) {
+    // If steering is small, trim it to help go straight
+    d.left = (int)((float)d.left * leftTrim);
+    d.right = (int)((float)d.right * rightTrim);
+  }
 
   // Clamp motor commands
   d.left  = clampInt(d.left,  -maxPwm, maxPwm);
