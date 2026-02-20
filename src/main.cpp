@@ -57,17 +57,17 @@ bool lastConnectedState = false;
 int leftStickDeadzone = 10;
 int triggerDeadzone = 6;
 
-int boostIntervalMs = 50; // interval of boost buzzer sound
-int reverseIntervalMs = 400; // interval of reverse buzzer sound
+int boostIntervalMs = 50;     // interval of boost buzzer sound
+int reverseIntervalMs = 400;  // interval of reverse buzzer sound
+
+unsigned long lastModeSwitchMs = 0;
+
+// (You can keep these, but steering is now controlled by base+boost below)
+float ecoTurnScale = 0.6;
+float normalTurnScale = 0.8;
+float sportTurnScale = 1.0;
 
 // ======================== FEEDBACK STATE MACHINE ========================
-/*
-  Stores all timing and state variables for:
-  - Non-blocking buzzer pattern playback
-  - Non-blocking RGB blink playback
-
-  This struct acts as a small state machine.
-*/
 struct feedbackState { 
   bool lastConnected = false;
 
@@ -93,6 +93,15 @@ struct feedbackState {
 feedbackState feedback;
 
 // ======================== CONTROLLER & DRIVE STRUCTURES ========================
+
+enum DriveMode {
+  ECO,
+  NORMAL,
+  SPORT
+};
+
+DriveMode mode = NORMAL;
+bool prevTriangleState = false; // For edge detection of mode button
 
 enum BuzzerState {
   PATTERN,
@@ -149,6 +158,20 @@ struct MotorOut {
 MotorOut leftMotor;
 MotorOut rightMotor;
 
+// ======================== SMALL HELPERS ========================
+
+int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// Eliminates small joystick noise near zero
+int applyDeadzone(int value, int deadzone) {
+  if (abs(value) < deadzone) return 0;
+  return value;
+}
+
 // ======================== RGB CONTROL ========================
 // Sets RGB LED pins HIGH or LOW
 void setRGB(int r, int g, int b) {
@@ -159,7 +182,6 @@ void setRGB(int r, int g, int b) {
 
 /*
   Prepares an RGB blink pattern (non-blocking).
-  Does NOT block — only sets initial state.
 */
 void startRGBBlink (int r, int g, int b, int intervalMs, int blinkCount) { 
   feedback.r = r; feedback.g = g; feedback.b = b;
@@ -200,13 +222,18 @@ void updateRGB(unsigned long nowMs) {
   }
 }
 
+void baseRGB(DriveMode mode) {
+  if (feedback.rgbActive) return; // Don't override active feedback pattern
+
+  switch (mode) {
+    case ECO:    setRGB(0, 0, 1); break; // Blue
+    case NORMAL: setRGB(0, 1, 0); break; // Green
+    case SPORT:  setRGB(1, 0, 0); break; // Red
+    default:     setRGB(0, 0, 0); break; // Off
+  }
+}
 
 // ======================== BUZZER STATE MACHINE ========================
-/*
-  buzzerPattern[] stores alternating ON and OFF durations in ms.
-  buzzerStep tracks which duration is currently active.
-  This forms a simple state machine driven by millis().
-*/
 
 void startBeepPattern(int beepCount) {
   if (beepCount < 1) return;
@@ -229,7 +256,6 @@ void startBeepPattern(int beepCount) {
 
 /*
   Advances buzzer pattern using millis().
-  No blocking delays.
 */
 void updateBuzzer(unsigned long nowMs) {
   if (!feedback.buzzerActive) return;
@@ -281,6 +307,7 @@ void handleFeedback(bool connected) {
       startRGBBlink(1, 0, 0, 120, 2);
     }
   }
+
   updateRGB(now);
 }
 
@@ -300,25 +327,30 @@ void decideBuzzerState(feedbackState &fb, BuzzerState &buzstate, const Controlle
 
 void updateBuzzerSystem(BuzzerState buzstate) {
   unsigned long now = millis();
+
   switch (buzstate) {
     case PATTERN:
       updateBuzzer(now);
       break;
+
     case HORN:
       digitalWrite(BUZ, HIGH);
       break;
+
     case BOOST:
-      if (now - buzzerModeStartMs >= boostIntervalMs) {
+      if (now - buzzerModeStartMs >= (unsigned long)boostIntervalMs) {
         digitalWrite(BUZ, !digitalRead(BUZ)); // Toggle buzzer state
         buzzerModeStartMs = now;
-      } 
+      }
       break;
+
     case REVERSE:
-      if (now - buzzerModeStartMs >= reverseIntervalMs) {
+      if (now - buzzerModeStartMs >= (unsigned long)reverseIntervalMs) {
         digitalWrite(BUZ, !digitalRead(BUZ)); // Toggle buzzer state
         buzzerModeStartMs = now;
-      } 
+      }
       break;
+
     case STANDBY:
       digitalWrite(BUZ, LOW);
       break;
@@ -326,6 +358,15 @@ void updateBuzzerSystem(BuzzerState buzstate) {
 }
 
 // ======================== MOTOR CONTROL ========================
+
+int getMaxPwmForMode(DriveMode mode) {
+  switch (mode) {
+    case ECO:    return 150;
+    case NORMAL: return 220;
+    case SPORT:  return 255;
+    default:     return 255;
+  }
+}
 
 MotorOut mapMotor(int cmd, enum StopMode stop) {
   MotorOut m;
@@ -346,15 +387,32 @@ MotorOut mapMotor(int cmd, enum StopMode stop) {
     m.pwmA = 255;
     m.pwmB = 255;
   }
+
   return m;
 }
 
-// Eliminates small joystick noise near zero
-int applyDeadzone(int value, int deadzone) {
-  if (abs(value) < deadzone) {
-    return 0;
-  }
-  return value;
+// --------- NEW STEERING MODEL (what you asked for) ---------
+// Fixed base steering per mode, plus extra steering as speed increases.
+//
+// steeringStrength = base + boost * speedNormalized
+// steering = stick * steeringStrength
+//
+// This means:
+// - Each mode "feels" consistent at low speed (base)
+// - Turning gets stronger at higher speeds (boost)
+struct TurnParams {
+  float base;   // fixed steering at low speed (0.0..1.0 of maxPwm)
+  float boost;  // added steering at high speed (0.0..1.0 of maxPwm)
+};
+
+TurnParams getTurnParams(DriveMode m) {
+  // TUNING START POINTS (easy to tweak)
+  // Base is the minimum steering feel at low speed. Boost is how much stronger it gets at high speed.
+  
+
+  if (m == SPORT)  return { 0.75f, 0.25f }; // aggressive base, still gains at speed
+  if (m == NORMAL) return { 0.60f, 0.30f }; // solid base + noticeable high-speed boost
+  return { 0.55f, 0.35f };                  // ECO: decent base + strong boost so it turns while moving
 }
 
 /*
@@ -362,24 +420,50 @@ int applyDeadzone(int value, int deadzone) {
     left  = throttle + steering
     right = throttle - steering
 */
-void computeDriveCommand(const ControllerInput c, DriveCommand &d) {
-  int r2 = c.r2;
-  int l2 = c.l2;
+void computeDriveCommand(const ControllerInput c, DriveCommand &d, DriveMode mode) {
+  int maxPwm = getMaxPwmForMode(mode);
 
-  int throttle = r2 - l2;
-  int steering = c.lx;
+  // Throttle
+  int throttleRaw = (int)c.r2 - (int)c.l2;
+  d.throttle = applyDeadzone(throttleRaw, triggerDeadzone);
 
-  d.throttle = applyDeadzone(throttle, triggerDeadzone);
-  d.steering = applyDeadzone(steering, leftStickDeadzone);
+  // Normalize speed based on THIS mode's max PWM (0.0 at stop, 1.0 at full for that mode)
+  float speedN = 0.0f;
+  if (maxPwm > 0) speedN = (float)abs(d.throttle) / (float)maxPwm;
+  if (speedN > 1.0f) speedN = 1.0f;
 
-  d.left = d.throttle + d.steering;
+  // Read stick with deadzone
+  int lx = applyDeadzone(c.lx, leftStickDeadzone);
+
+  // Convert stick to -1..1 (safe clamp)
+  // Most PS5 libs are about -128..127. If yours is bigger, clamp keeps it sane.
+  float stick = (float)lx / 127.0f;
+  if (stick > 1.0f) stick = 1.0f;
+  if (stick < -1.0f) stick = -1.0f;
+
+  // Mode params
+  TurnParams tp = getTurnParams(mode);
+
+  // Steering strength in PWM units:
+  // baseStrength is always there (fixed feel)
+  // boostStrength increases with speed
+  float strengthN = tp.base + tp.boost * speedN;   // in "fraction of maxPwm"
+  if (strengthN > 1.0f) strengthN = 1.0f;          // never exceed maxPwm
+
+  int steering = (int)(stick * (float)maxPwm * strengthN);
+
+  // Clamp steering
+  steering = clampInt(steering, -maxPwm, maxPwm);
+
+  d.steering = steering;
+
+  // Mix
+  d.left  = d.throttle + d.steering;
   d.right = d.throttle - d.steering;
 
-  if (d.left > 255) d.left = 255;
-  if (d.left < -255) d.left = -255;
-
-  if (d.right > 255) d.right = 255;
-  if (d.right < -255) d.right = -255;
+  // Clamp motor commands
+  d.left  = clampInt(d.left,  -maxPwm, maxPwm);
+  d.right = clampInt(d.right, -maxPwm, maxPwm);
 }
 
 // Reads controller safely
@@ -413,7 +497,6 @@ void writeMotorOutputs(const MotorOut left, const MotorOut right) {
 // ======================== SETUP ========================
 
 void setup() {
-
   Serial.begin(115200);
   Serial.println(esp_reset_reason());
   ps5.begin("E8:47:3A:BC:DD:DF");
@@ -444,9 +527,9 @@ void setup() {
 }
 
 // ======================== MAIN LOOP ========================
-// Non-blocking control loop
 
 void loop() {
+  unsigned long now = millis();
 
   readController(controller);
 
@@ -458,15 +541,33 @@ void loop() {
     digitalWrite(BUZ, LOW); // Ensure buzzer is off when changing state
   }
 
+  if (now - lastModeSwitchMs > 250) { // Throttle mode switching to prevent rapid toggling
+    lastModeSwitchMs = now;
+
+    bool triangleState = ps5.Triangle();
+    if (triangleState && !prevTriangleState) {
+      // Cycle through drive modes on triangle button press
+      if (mode == ECO) {
+        mode = NORMAL;
+      } else if (mode == NORMAL) {
+        mode = SPORT;
+      } else {
+        mode = ECO;
+      }
+    }
+    prevTriangleState = triangleState;
+  }
+
   updateBuzzerSystem(buzzerState);
 
   handleFeedback(controller.connected);
 
-  computeDriveCommand(controller, driveCommand);
+  baseRGB(mode);
+
+  computeDriveCommand(controller, driveCommand, mode);
 
   leftMotor = mapMotor(driveCommand.left, COAST);
   rightMotor = mapMotor(driveCommand.right, COAST);
 
   writeMotorOutputs(leftMotor, rightMotor);
-  
 }
